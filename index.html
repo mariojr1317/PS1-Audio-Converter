@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+    <title>PS1 Audio Converter</title>
+
+    <link rel="stylesheet" href="style.css">
+</head>
+
+<body>
+
+    <main class="container">
+
+        <header>
+            <h1>💿 PS1 Audio Converter</h1>
+            <p>Convierte WAV PCM a una imagen de CD de audio compatible con PS1.</p>
+        </header>
+
+        <section class="card">
+
+            <label for="audioFile" class="file-label">
+                Seleccionar archivo WAV
+            </label>
+
+            <input
+                type="file"
+                id="audioFile"
+                accept=".wav,audio/wav"
+            >
+
+            <div id="fileInfo" class="info">
+                Ningún archivo seleccionado.
+            </div>
+
+            <button id="convertButton" disabled>
+                Convertir a BIN + CUE
+            </button>
+
+            <div class="progress-container">
+                <div id="progressBar"></div>
+            </div>
+
+            <p id="status">Esperando archivo...</p>
+
+            <div id="downloads"></div>
+
+        </section>
+
+        <section class="card info-card">
+
+            <h2>Formato requerido</h2>
+
+            <ul>
+                <li>PCM sin compresión</li>
+                <li>16-bit</li>
+                <li>44,100 Hz</li>
+                <li>Estéreo</li>
+            </ul>
+
+        </section>
+
+    </main>
+
+    <script src="converter.js"></script>
+
+</body>
+</html>
