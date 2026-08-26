@@ -2,33 +2,41 @@
 
 /*
  * PS1 Audio Converter
- * WAV PCM 16-bit / 44.1 kHz / Stereo
- *                         ↓
- *               CD-DA RAW BIN + CUE
  *
- * IMPORTANTE:
- * - El WAV fuente NO se modifica.
- * - El BIN contiene únicamente audio PCM RAW.
- * - Cada sector CD-DA contiene exactamente 2352 bytes.
- * - 2352 bytes = 588 muestras estéreo de 16 bits.
+ * WAV PCM 16-bit / 44,100 Hz / Stereo
+ *                  ↓
+ *          RAW CD-DA BIN + CUE
+ *
+ * El WAV se procesa por bloques para poder trabajar
+ * con archivos grandes sin cargar todo el archivo de una vez.
  */
 
 const CDDA_SECTOR_SIZE = 2352;
 const SAMPLE_RATE = 44100;
 const CHANNELS = 2;
-const BYTES_PER_SAMPLE = 2;
-const SAMPLES_PER_SECTOR = 588;
+const BITS_PER_SAMPLE = 16;
+const BYTES_PER_SAMPLE = BITS_PER_SAMPLE / 8;
+const BYTES_PER_FRAME = CHANNELS * BYTES_PER_SAMPLE;
 
-const EXPECTED_BYTES_PER_SECOND =
-    SAMPLE_RATE * CHANNELS * BYTES_PER_SAMPLE;
+// 44100 samples/sec / 75 sectores/sec = 588 frames/sector
+const FRAMES_PER_SECTOR = 588;
 
-const EXPECTED_BYTES_PER_SECTOR =
-    SAMPLES_PER_SECTOR * CHANNELS * BYTES_PER_SAMPLE;
+const BYTES_PER_SECOND =
+    SAMPLE_RATE * BYTES_PER_FRAME;
 
-// Debe ser exactamente 2352.
-if (EXPECTED_BYTES_PER_SECTOR !== CDDA_SECTOR_SIZE) {
-    throw new Error("Error interno: tamaño de sector CDDA incorrecto.");
+const BYTES_PER_SECTOR =
+    FRAMES_PER_SECTOR * BYTES_PER_FRAME;
+
+if (BYTES_PER_SECTOR !== CDDA_SECTOR_SIZE) {
+    throw new Error(
+        "Error interno: CDDA debe utilizar exactamente 2352 bytes por sector."
+    );
 }
+
+
+/* ============================================================
+   ELEMENTOS DE LA INTERFAZ
+   ============================================================ */
 
 const audioFileInput = document.getElementById("audioFile");
 const convertButton = document.getElementById("convertButton");
@@ -42,12 +50,14 @@ let wavInfo = null;
 
 
 /* ============================================================
-   EVENTOS
+   SELECCIÓN DEL ARCHIVO
    ============================================================ */
 
 audioFileInput.addEventListener("change", async () => {
     selectedFile = audioFileInput.files?.[0] ?? null;
+
     wavInfo = null;
+
     downloads.innerHTML = "";
     progressBar.style.width = "0%";
 
@@ -59,16 +69,22 @@ audioFileInput.addEventListener("change", async () => {
     }
 
     convertButton.disabled = true;
-    statusText.textContent = "Analizando WAV...";
+
+    fileInfo.innerHTML =
+        `<strong>${escapeHtml(selectedFile.name)}</strong>`;
+
+    statusText.textContent =
+        "Analizando estructura WAV...";
 
     try {
-        wavInfo = await parseWavHeader(selectedFile);
+        wavInfo = await parseWav(selectedFile);
 
-        renderWavInformation(wavInfo);
+        showWavInformation(wavInfo);
 
         if (!isCompatibleWav(wavInfo)) {
             statusText.textContent =
-                "❌ El WAV no tiene el formato compatible con CD-DA.";
+                "❌ El WAV no cumple los requisitos de CD-DA.";
+
             return;
         }
 
@@ -80,14 +96,22 @@ audioFileInput.addEventListener("change", async () => {
     } catch (error) {
         console.error(error);
 
-        fileInfo.innerHTML =
-            `<strong>❌ Error</strong><br>${escapeHtml(error.message)}`;
+        fileInfo.innerHTML = `
+            <strong>❌ Error al analizar WAV</strong><br>
+            ${escapeHtml(error.message)}
+        `;
 
         statusText.textContent =
-            "No se pudo analizar el WAV.";
+            "No se pudo analizar el archivo.";
+
+        convertButton.disabled = true;
     }
 });
 
+
+/* ============================================================
+   BOTÓN CONVERTIR
+   ============================================================ */
 
 convertButton.addEventListener("click", async () => {
     if (!selectedFile || !wavInfo) {
@@ -95,10 +119,16 @@ convertButton.addEventListener("click", async () => {
     }
 
     convertButton.disabled = true;
+
     downloads.innerHTML = "";
+    progressBar.style.width = "0%";
 
     try {
-        await convertWavToCdda(selectedFile, wavInfo);
+        await convertWavToCdda(
+            selectedFile,
+            wavInfo
+        );
+
     } catch (error) {
         console.error(error);
 
@@ -117,40 +147,51 @@ convertButton.addEventListener("click", async () => {
    PARSER WAV
    ============================================================ */
 
-async function parseWavHeader(file) {
-    /*
-     * No leemos los cientos de MB completos.
-     * Solamente buscamos los chunks RIFF/WAVE.
-     *
-     * Un WAV válido puede tener:
-     *
-     * RIFF
-     *   fmt
-     *   LIST
-     *   JUNK
-     *   fact
-     *   data
-     *
-     * Por eso NO debemos asumir que "data" está en una posición fija.
-     */
+/*
+ * Esta función NO busca la palabra "data" a ciegas.
+ *
+ * Recorre los chunks RIFF de manera estructurada:
+ *
+ * RIFF
+ * WAVE
+ * fmt
+ * LIST
+ * JUNK
+ * fact
+ * ...
+ * data
+ *
+ * De esta forma evitamos encontrar accidentalmente los bytes
+ * "data" dentro de metadata.
+ */
 
-    const MAX_SCAN = Math.min(file.size, 1024 * 1024);
-    const buffer = await file.slice(0, MAX_SCAN).arrayBuffer();
-    const view = new DataView(buffer);
-
-    if (view.byteLength < 12) {
-        throw new Error("El archivo es demasiado pequeño para ser un WAV.");
+async function parseWav(file) {
+    if (file.size < 12) {
+        throw new Error(
+            "El archivo es demasiado pequeño para ser un WAV."
+        );
     }
 
-    const riff = readAscii(view, 0, 4);
-    const wave = readAscii(view, 8, 4);
+    const header = new DataView(
+        await file.slice(0, 12).arrayBuffer()
+    );
 
-    if (riff !== "RIFF") {
-        throw new Error("El archivo no contiene un encabezado RIFF.");
+    const riffId =
+        readFourCC(header, 0);
+
+    const waveId =
+        readFourCC(header, 8);
+
+    if (riffId !== "RIFF") {
+        throw new Error(
+            `Firma incorrecta: se esperaba RIFF y se encontró "${riffId}".`
+        );
     }
 
-    if (wave !== "WAVE") {
-        throw new Error("El archivo RIFF no es un WAVE.");
+    if (waveId !== "WAVE") {
+        throw new Error(
+            `Formato incorrecto: se esperaba WAVE y se encontró "${waveId}".`
+        );
     }
 
     let offset = 12;
@@ -159,49 +200,95 @@ async function parseWavHeader(file) {
     let dataOffset = null;
     let dataSize = null;
 
-    while (offset + 8 <= view.byteLength) {
-        const chunkId = readAscii(view, offset, 4);
-        const chunkSize = view.getUint32(offset + 4, true);
-        const chunkDataOffset = offset + 8;
+    /*
+     * Leemos cada encabezado de chunk individualmente.
+     * No importa que el WAV tenga cientos de MB:
+     * aquí solo estamos recorriendo sus metadatos.
+     */
+
+    while (offset + 8 <= file.size) {
+
+        const chunkHeaderBuffer =
+            await file
+                .slice(offset, offset + 8)
+                .arrayBuffer();
+
+        if (chunkHeaderBuffer.byteLength !== 8) {
+            throw new Error(
+                "No se pudo leer un encabezado de chunk WAV."
+            );
+        }
+
+        const chunkHeader =
+            new DataView(chunkHeaderBuffer);
+
+        const chunkId =
+            readFourCC(chunkHeader, 0);
+
+        const chunkSize =
+            chunkHeader.getUint32(4, true);
+
+        const chunkDataOffset =
+            offset + 8;
+
+        /*
+         * Comprobación contra archivos corruptos.
+         */
+        if (chunkDataOffset > file.size) {
+            throw new Error(
+                `Chunk "${chunkId}" fuera de los límites del archivo.`
+            );
+        }
+
+        if (chunkSize > file.size - chunkDataOffset) {
+            throw new Error(
+                `El chunk "${chunkId}" declara más datos de los que existen.`
+            );
+        }
 
         if (chunkId === "fmt ") {
-            if (chunkDataOffset + chunkSize > view.byteLength) {
-                throw new Error("El chunk fmt está incompleto.");
-            }
 
             if (chunkSize < 16) {
-                throw new Error("El chunk fmt es inválido.");
+                throw new Error(
+                    "El chunk fmt tiene menos de 16 bytes."
+                );
             }
 
+            /*
+             * Normalmente son solo 16 bytes para PCM.
+             * No necesitamos leer todo el chunk si es más grande.
+             */
+            const fmtSize =
+                Math.min(chunkSize, 64);
+
+            const fmtBuffer =
+                await file
+                    .slice(
+                        chunkDataOffset,
+                        chunkDataOffset + fmtSize
+                    )
+                    .arrayBuffer();
+
+            const fmtView =
+                new DataView(fmtBuffer);
+
             const audioFormat =
-                view.getUint16(chunkDataOffset, true);
+                fmtView.getUint16(0, true);
 
             const channels =
-                view.getUint16(chunkDataOffset + 2, true);
+                fmtView.getUint16(2, true);
 
             const sampleRate =
-                view.getUint32(chunkDataOffset + 4, true);
+                fmtView.getUint32(4, true);
 
             const byteRate =
-                view.getUint32(chunkDataOffset + 8, true);
+                fmtView.getUint32(8, true);
 
             const blockAlign =
-                view.getUint16(chunkDataOffset + 12, true);
+                fmtView.getUint16(12, true);
 
             const bitsPerSample =
-                view.getUint16(chunkDataOffset + 14, true);
-
-            let validBitsPerSample = bitsPerSample;
-            let channelMask = null;
-
-            /*
-             * WAV extensible:
-             * AudioFormat = 0xFFFE
-             *
-             * Para nuestro convertidor solo aceptaremos PCM
-             * clásico (1), porque el usuario ya tiene el WAV
-             * preparado como PCM 16-bit.
-             */
+                fmtView.getUint16(14, true);
 
             fmt = {
                 audioFormat,
@@ -209,9 +296,7 @@ async function parseWavHeader(file) {
                 sampleRate,
                 byteRate,
                 blockAlign,
-                bitsPerSample,
-                validBitsPerSample,
-                channelMask
+                bitsPerSample
             };
         }
 
@@ -222,33 +307,55 @@ async function parseWavHeader(file) {
         }
 
         /*
-         * Los chunks RIFF tienen tamaño par.
-         * Si el tamaño es impar, se agrega un byte de padding.
+         * RIFF alinea chunks a un número par de bytes.
          */
-        offset =
-            chunkDataOffset +
-            chunkSize +
-            (chunkSize & 1);
+        const paddedChunkSize =
+            chunkSize + (chunkSize & 1);
+
+        const nextOffset =
+            chunkDataOffset + paddedChunkSize;
+
+        if (nextOffset <= offset) {
+            throw new Error(
+                "Se detectó un desplazamiento inválido dentro del WAV."
+            );
+        }
+
+        offset = nextOffset;
+
+        /*
+         * Protección contra archivos dañados.
+         */
+        if (offset > file.size) {
+            throw new Error(
+                `El chunk "${chunkId}" apunta fuera del archivo.`
+            );
+        }
+
+        /*
+         * Cuando ya tenemos fmt y llegamos a data,
+         * el bucle termina arriba.
+         */
     }
 
     if (!fmt) {
-        throw new Error("No se encontró el chunk fmt.");
+        throw new Error(
+            'No se encontró el chunk "fmt ".'
+        );
     }
 
     if (dataOffset === null || dataSize === null) {
-        /*
-         * Si el data chunk está después del primer MB,
-         * hacemos una búsqueda incremental.
-         */
-        const found = await findDataChunk(file);
-
-        dataOffset = found.dataOffset;
-        dataSize = found.dataSize;
+        throw new Error(
+            'No se encontró un chunk "data" válido.'
+        );
     }
 
+    /*
+     * Verificación final.
+     */
     if (dataOffset + dataSize > file.size) {
         throw new Error(
-            "El chunk de audio supera el tamaño real del archivo."
+            "Los datos PCM superan el tamaño físico del archivo."
         );
     }
 
@@ -260,293 +367,320 @@ async function parseWavHeader(file) {
 }
 
 
-async function findDataChunk(file) {
+/* ============================================================
+   VALIDACIÓN DEL WAV
+   ============================================================ */
+
+function isCompatibleWav(info) {
+
     /*
-     * Algunos WAV pueden tener metadata antes de "data".
-     * Vamos buscando por bloques pequeños.
+     * audioFormat:
+     * 1 = PCM lineal
      */
-
-    const CHUNK = 256 * 1024;
-
-    let scanStart = 0;
-
-    while (scanStart < file.size) {
-        const scanEnd = Math.min(
-            scanStart + CHUNK,
-            file.size
-        );
-
-        const buffer = await file
-            .slice(scanStart, scanEnd)
-            .arrayBuffer();
-
-        const bytes = new Uint8Array(buffer);
-
-        for (let i = 0; i <= bytes.length - 8; i++) {
-            if (
-                bytes[i] === 0x64 && // d
-                bytes[i + 1] === 0x61 && // a
-                bytes[i + 2] === 0x74 && // t
-                bytes[i + 3] === 0x61    // a
-            ) {
-                const view = new DataView(
-                    buffer,
-                    i,
-                    bytes.length - i
-                );
-
-                if (view.byteLength < 8) {
-                    continue;
-                }
-
-                const size =
-                    view.getUint32(4, true);
-
-                const absoluteOffset =
-                    scanStart + i + 8;
-
-                if (
-                    absoluteOffset <= file.size &&
-                    size <= file.size - absoluteOffset
-                ) {
-                    return {
-                        dataOffset: absoluteOffset,
-                        dataSize: size
-                    };
-                }
-            }
-        }
-
-        scanStart += CHUNK - 7;
+    if (info.audioFormat !== 1) {
+        return false;
     }
 
-    throw new Error("No se encontró el chunk data.");
+    if (info.channels !== CHANNELS) {
+        return false;
+    }
+
+    if (info.sampleRate !== SAMPLE_RATE) {
+        return false;
+    }
+
+    if (info.bitsPerSample !== BITS_PER_SAMPLE) {
+        return false;
+    }
+
+    if (info.blockAlign !== BYTES_PER_FRAME) {
+        return false;
+    }
+
+    if (info.byteRate !== BYTES_PER_SECOND) {
+        return false;
+    }
+
+    return true;
 }
 
 
 /* ============================================================
-   VALIDACIÓN
+   INFORMACIÓN DEL WAV
    ============================================================ */
 
-function isCompatibleWav(info) {
-    return (
-        info.audioFormat === 1 &&
-        info.channels === 2 &&
-        info.sampleRate === SAMPLE_RATE &&
-        info.bitsPerSample === 16 &&
-        info.blockAlign === 4 &&
-        info.byteRate === EXPECTED_BYTES_PER_SECOND
-    );
-}
+function showWavInformation(info) {
 
-
-function renderWavInformation(info) {
     const durationSeconds =
-        info.dataSize / EXPECTED_BYTES_PER_SECOND;
+        info.dataSize / BYTES_PER_SECOND;
 
     const sectorCount =
         Math.ceil(
-            info.dataSize / CDDA_SECTOR_SIZE
+            info.dataSize /
+            CDDA_SECTOR_SIZE
         );
+
+    const expectedBinSize =
+        sectorCount *
+        CDDA_SECTOR_SIZE;
 
     fileInfo.innerHTML = `
         <strong>${escapeHtml(selectedFile.name)}</strong><br>
         Tamaño: ${formatBytes(selectedFile.size)}<br>
-        Audio: ${info.audioFormat === 1 ? "PCM" : "No PCM"}<br>
+        Audio: ${
+            info.audioFormat === 1
+                ? "PCM"
+                : `Formato ${info.audioFormat}`
+        }<br>
         Canales: ${info.channels}<br>
         Frecuencia: ${info.sampleRate.toLocaleString()} Hz<br>
         Profundidad: ${info.bitsPerSample}-bit<br>
-        Datos de audio: ${formatBytes(info.dataSize)}<br>
+        Datos PCM: ${formatBytes(info.dataSize)}<br>
         Duración: ${formatDuration(durationSeconds)}<br>
-        Sectores CDDA: ${sectorCount.toLocaleString()}
+        Sectores CDDA: ${sectorCount.toLocaleString()}<br>
+        BIN esperado: ${formatBytes(expectedBinSize)}
     `;
 }
 
 
 /* ============================================================
-   CONVERSIÓN WAV → CDDA BIN
+   WAV → CDDA
    ============================================================ */
 
 async function convertWavToCdda(file, info) {
+
     statusText.textContent =
-        "Preparando conversión CD-DA...";
+        "Calculando imagen CD-DA...";
 
     progressBar.style.width = "0%";
 
     /*
-     * Calculamos cuántos bytes reales necesita el BIN.
+     * Un sector de CD-DA contiene:
      *
-     * Cada sector CDDA = 2352 bytes.
+     * 588 frames
+     *
+     * Cada frame:
+     *
+     * 2 canales × 16 bits
+     *
+     * 588 × 2 × 2 = 2352 bytes
      */
+
     const sectorCount =
         Math.ceil(
-            info.dataSize / CDDA_SECTOR_SIZE
+            info.dataSize /
+            CDDA_SECTOR_SIZE
         );
 
     const outputSize =
-        sectorCount * CDDA_SECTOR_SIZE;
+        sectorCount *
+        CDDA_SECTOR_SIZE;
 
     /*
-     * Trabajamos por bloques.
+     * Leemos exactamente múltiplos razonables de 2352.
      *
-     * No usamos file.arrayBuffer() para todo el WAV.
-     * Eso sería muy mala idea con un archivo de 600+ MB.
+     * 4 MB no es múltiplo exacto de 2352, así que
+     * mantenemos un pequeño "carry" entre bloques.
      */
-
-    const READ_CHUNK_SIZE =
-        4 * 1024 * 1024; // 4 MB
+    const READ_SIZE =
+        4 * 1024 * 1024;
 
     const outputParts = [];
 
-    let sourcePosition = info.dataOffset;
-    let remaining = info.dataSize;
+    let sourceOffset =
+        info.dataOffset;
 
-    let outputCarry = new Uint8Array(0);
+    let remaining =
+        info.dataSize;
 
-    let processed = 0;
+    let carry =
+        new Uint8Array(0);
+
+    let processed =
+        0;
 
     while (remaining > 0) {
-        const amount =
+
+        const readSize =
             Math.min(
-                READ_CHUNK_SIZE,
+                READ_SIZE,
                 remaining
             );
 
-        const arrayBuffer = await file
-            .slice(
-                sourcePosition,
-                sourcePosition + amount
-            )
-            .arrayBuffer();
+        const buffer =
+            await file
+                .slice(
+                    sourceOffset,
+                    sourceOffset + readSize
+                )
+                .arrayBuffer();
 
         const incoming =
-            new Uint8Array(arrayBuffer);
+            new Uint8Array(buffer);
 
         /*
-         * Unimos cualquier resto del bloque anterior
+         * Unimos el resto del bloque anterior
          * con el bloque actual.
          */
         let combined;
 
-        if (outputCarry.length > 0) {
-            combined = new Uint8Array(
-                outputCarry.length + incoming.length
-            );
+        if (carry.length === 0) {
 
-            combined.set(outputCarry, 0);
-            combined.set(
-                incoming,
-                outputCarry.length
-            );
+            combined =
+                incoming;
 
         } else {
-            combined = incoming;
+
+            combined =
+                new Uint8Array(
+                    carry.length +
+                    incoming.length
+                );
+
+            combined.set(
+                carry,
+                0
+            );
+
+            combined.set(
+                incoming,
+                carry.length
+            );
         }
 
-        const completeSize =
+        /*
+         * Solo producimos sectores completos.
+         */
+        const completeBytes =
             Math.floor(
                 combined.length /
                 CDDA_SECTOR_SIZE
             ) * CDDA_SECTOR_SIZE;
 
-        if (completeSize > 0) {
+        if (completeBytes > 0) {
+
             const complete =
-                combined.slice(
+                combined.subarray(
                     0,
-                    completeSize
+                    completeBytes
                 );
 
-            outputParts.push(complete);
-
-            outputCarry =
-                combined.slice(completeSize);
-        } else {
-            outputCarry = combined;
+            /*
+             * Copiamos el bloque para que no dependa
+             * del buffer original.
+             */
+            outputParts.push(
+                new Uint8Array(complete)
+            );
         }
 
-        sourcePosition += amount;
-        remaining -= amount;
-        processed += amount;
+        /*
+         * Guardamos lo que no alcanzó a formar un sector.
+         */
+        carry =
+            combined.slice(
+                completeBytes
+            );
+
+        sourceOffset += readSize;
+        remaining -= readSize;
+        processed += readSize;
 
         const percent =
-            (processed / info.dataSize) * 100;
+            (processed /
+                info.dataSize) *
+            100;
+
+        const visiblePercent =
+            Math.min(
+                99,
+                percent
+            );
 
         progressBar.style.width =
-            `${Math.min(percent, 99.5).toFixed(1)}%`;
+            `${visiblePercent.toFixed(1)}%`;
 
         statusText.textContent =
-            `Generando CD-DA... ${Math.min(percent, 99.5).toFixed(1)}%`;
+            `Generando CD-DA... ${visiblePercent.toFixed(1)}%`;
 
         /*
-         * Cedemos el hilo principal.
-         * Esto hace que Chrome no parezca completamente muerto
-         * durante un archivo enorme.
+         * Permitimos que Chrome actualice la interfaz.
          */
         await yieldToBrowser();
     }
 
     /*
-     * Si quedaron bytes incompletos, rellenamos el último sector
-     * con silencio digital.
+     * El último sector puede estar incompleto.
+     *
+     * Lo rellenamos con cero = silencio.
      */
-    if (outputCarry.length > 0) {
-        const finalSector =
-            new Uint8Array(CDDA_SECTOR_SIZE);
+    if (carry.length > 0) {
 
-        finalSector.set(outputCarry, 0);
+        const lastSector =
+            new Uint8Array(
+                CDDA_SECTOR_SIZE
+            );
 
-        /*
-         * Uint8Array nuevo viene inicializado en cero,
-         * así que el resto queda en silencio.
-         */
-        outputParts.push(finalSector);
+        lastSector.set(
+            carry
+        );
+
+        outputParts.push(
+            lastSector
+        );
     }
 
     /*
-     * Seguridad adicional:
-     * comprobamos que el tamaño final sea exactamente
-     * múltiplo de 2352.
+     * Comprobaciones.
      */
-    const finalSize =
-        outputParts.reduce(
-            (sum, part) => sum + part.byteLength,
-            0
-        );
 
-    if (finalSize % CDDA_SECTOR_SIZE !== 0) {
+    let generatedSize = 0;
+
+    for (const part of outputParts) {
+        generatedSize +=
+            part.byteLength;
+    }
+
+    if (
+        generatedSize %
+        CDDA_SECTOR_SIZE !==
+        0
+    ) {
         throw new Error(
-            "El BIN resultante no está alineado a 2352 bytes."
+            `El BIN no está alineado a ${CDDA_SECTOR_SIZE} bytes.`
         );
     }
 
-    if (finalSize !== outputSize) {
+    if (generatedSize !== outputSize) {
         throw new Error(
-            "El tamaño final del BIN no coincide con el esperado."
+            `Tamaño BIN incorrecto. ` +
+            `Esperado: ${outputSize}, ` +
+            `generado: ${generatedSize}.`
         );
     }
-
-    statusText.textContent =
-        "Construyendo archivos BIN + CUE...";
-
-    progressBar.style.width = "99.7%";
 
     /*
-     * IMPORTANTE:
+     * El BIN empieza directamente con audio PCM.
      *
-     * El BIN de audio CDDA no tiene header WAV,
-     * ni RIFF, ni WAVE, ni fmt, ni data.
-     *
-     * Contiene directamente los frames PCM.
+     * NO incluimos:
+     * RIFF
+     * WAVE
+     * fmt
+     * data
      */
-    const binBlob = new Blob(
-        outputParts,
-        {
-            type: "application/octet-stream"
-        }
-    );
+    const binBlob =
+        new Blob(
+            outputParts,
+            {
+                type:
+                    "application/octet-stream"
+            }
+        );
 
     const baseName =
-        removeExtension(file.name);
+        removeExtension(
+            file.name
+        );
 
     const binName =
         `${baseName}.bin`;
@@ -554,19 +688,25 @@ async function convertWavToCdda(file, info) {
     const cueName =
         `${baseName}.cue`;
 
+    /*
+     * Una única pista AUDIO.
+     */
     const cueText =
-        buildSingleTrackCue(binName);
+        createCue(
+            binName
+        );
 
     const cueBlob =
         new Blob(
             [cueText],
             {
-                type: "text/plain;charset=utf-8"
+                type:
+                    "text/plain;charset=utf-8"
             }
         );
 
     /*
-     * Creamos las descargas.
+     * Mostrar descargas.
      */
     createDownload(
         binBlob,
@@ -580,34 +720,38 @@ async function convertWavToCdda(file, info) {
         "📄 Descargar CUE"
     );
 
-    progressBar.style.width = "100%";
+    progressBar.style.width =
+        "100%";
 
     const duration =
         info.dataSize /
-        EXPECTED_BYTES_PER_SECOND;
+        BYTES_PER_SECOND;
 
     statusText.textContent =
-        `✅ CD-DA terminado. ${formatDuration(duration)} de audio.`;
+        `✅ Conversión terminada — ${formatDuration(duration)}.`;
 
-    /*
-     * Información adicional para depuración.
-     */
-    const debug = document.createElement("div");
+    const summary =
+        document.createElement(
+            "div"
+        );
 
-    debug.className = "conversion-summary";
+    summary.className =
+        "conversion-summary";
 
-    debug.innerHTML = `
+    summary.innerHTML = `
         <br>
-        <strong>Resultado:</strong><br>
-        BIN: ${formatBytes(finalSize)}<br>
+        <strong>Imagen creada correctamente</strong><br>
+        BIN: ${formatBytes(generatedSize)}<br>
         Sectores: ${sectorCount.toLocaleString()}<br>
-        Tamaño de sector: ${CDDA_SECTOR_SIZE} bytes<br>
-        Frecuencia: ${SAMPLE_RATE.toLocaleString()} Hz<br>
+        Tamaño por sector: ${CDDA_SECTOR_SIZE} bytes<br>
         Audio: PCM 16-bit estéreo<br>
+        Frecuencia: ${SAMPLE_RATE.toLocaleString()} Hz<br>
         Tipo: CD-DA RAW
     `;
 
-    downloads.appendChild(debug);
+    downloads.appendChild(
+        summary
+    );
 }
 
 
@@ -615,23 +759,30 @@ async function convertWavToCdda(file, info) {
    CUE
    ============================================================ */
 
-function buildSingleTrackCue(binFileName) {
+function createCue(binName) {
+
     /*
-     * Para una única pista de audio:
+     * El CUE debe estar junto al BIN.
      *
-     * FILE "nombre.bin" BINARY
+     * Ejemplo:
+     *
+     * FILE "cancion.bin" BINARY
      *   TRACK 01 AUDIO
      *     INDEX 01 00:00:00
      */
 
     const safeName =
-        binFileName.replaceAll('"', '""');
+        binName
+            .replaceAll(
+                '"',
+                '""'
+            );
 
     return [
         `FILE "${safeName}" BINARY`,
         `  TRACK 01 AUDIO`,
         `    INDEX 01 00:00:00`,
-        ``
+        ""
     ].join("\n");
 }
 
@@ -640,45 +791,63 @@ function buildSingleTrackCue(binFileName) {
    DESCARGAS
    ============================================================ */
 
-function createDownload(blob, filename, label) {
+function createDownload(
+    blob,
+    filename,
+    text
+) {
     const url =
-        URL.createObjectURL(blob);
+        URL.createObjectURL(
+            blob
+        );
 
     const link =
-        document.createElement("a");
+        document.createElement(
+            "a"
+        );
 
-    link.href = url;
-    link.download = filename;
-    link.className = "download";
-    link.textContent = label;
+    link.href =
+        url;
 
-    downloads.appendChild(link);
+    link.download =
+        filename;
 
-    /*
-     * No revocamos inmediatamente el URL,
-     * porque el usuario todavía necesita hacer clic.
-     */
+    link.className =
+        "download";
+
+    link.textContent =
+        text;
+
+    downloads.appendChild(
+        link
+    );
 }
 
 
 /* ============================================================
-   UTILIDADES
+   UTILIDADES WAV
    ============================================================ */
 
-function readAscii(view, offset, length) {
-    let result = "";
-
-    for (let i = 0; i < length; i++) {
-        result += String.fromCharCode(
-            view.getUint8(offset + i)
-        );
-    }
-
-    return result;
+function readFourCC(
+    view,
+    offset
+) {
+    return String.fromCharCode(
+        view.getUint8(offset),
+        view.getUint8(offset + 1),
+        view.getUint8(offset + 2),
+        view.getUint8(offset + 3)
+    );
 }
 
 
-function removeExtension(filename) {
+/* ============================================================
+   UTILIDADES GENERALES
+   ============================================================ */
+
+function removeExtension(
+    filename
+) {
     return filename.replace(
         /\.[^/.]+$/,
         ""
@@ -686,7 +855,9 @@ function removeExtension(filename) {
 }
 
 
-function formatBytes(bytes) {
+function formatBytes(
+    bytes
+) {
     if (bytes === 0) {
         return "0 B";
     }
@@ -710,62 +881,106 @@ function formatBytes(bytes) {
 
     const value =
         bytes /
-        Math.pow(1024, exponent);
-
-    return `${value.toFixed(2)} ${units[exponent]}`;
-}
-
-
-function formatDuration(totalSeconds) {
-    const total =
-        Math.max(
-            0,
-            Math.floor(totalSeconds)
+        Math.pow(
+            1024,
+            exponent
         );
-
-    const hours =
-        Math.floor(total / 3600);
-
-    const minutes =
-        Math.floor(
-            (total % 3600) / 60
-        );
-
-    const seconds =
-        total % 60;
-
-    if (hours > 0) {
-        return (
-            `${hours}:${String(minutes).padStart(2, "0")}:` +
-            `${String(seconds).padStart(2, "0")}`
-        );
-    }
 
     return (
-        `${minutes}:${String(seconds).padStart(2, "0")}`
+        `${value.toFixed(2)} ` +
+        `${units[exponent]}`
     );
 }
 
 
-function escapeHtml(text) {
-    return String(text)
-        .replaceAll("&", "&amp;")
-        .replaceAll("<", "&lt;")
-        .replaceAll(">", "&gt;")
-        .replaceAll('"', "&quot;")
-        .replaceAll("'", "&#039;");
+function formatDuration(
+    seconds
+) {
+    const total =
+        Math.max(
+            0,
+            Math.floor(seconds)
+        );
+
+    const hours =
+        Math.floor(
+            total / 3600
+        );
+
+    const minutes =
+        Math.floor(
+            (total % 3600) /
+            60
+        );
+
+    const secs =
+        total % 60;
+
+    if (hours > 0) {
+        return (
+            `${hours}:` +
+            `${String(minutes).padStart(2, "0")}:` +
+            `${String(secs).padStart(2, "0")}`
+        );
+    }
+
+    return (
+        `${minutes}:` +
+        `${String(secs).padStart(2, "0")}`
+    );
 }
 
 
+function escapeHtml(
+    value
+) {
+    return String(value)
+        .replaceAll(
+            "&",
+            "&amp;"
+        )
+        .replaceAll(
+            "<",
+            "&lt;"
+        )
+        .replaceAll(
+            ">",
+            "&gt;"
+        )
+        .replaceAll(
+            '"',
+            "&quot;"
+        )
+        .replaceAll(
+            "'",
+            "&#039;"
+        );
+}
+
+
+/* ============================================================
+   MANTENER RESPONSIVA LA PÁGINA
+   ============================================================ */
+
 function yieldToBrowser() {
-    return new Promise(resolve => {
-        if ("requestIdleCallback" in window) {
-            requestIdleCallback(
-                () => resolve(),
-                { timeout: 50 }
-            );
-        } else {
-            setTimeout(resolve, 0);
+    return new Promise(
+        resolve => {
+            if (
+                "requestIdleCallback"
+                in window
+            ) {
+                requestIdleCallback(
+                    () => resolve(),
+                    {
+                        timeout: 50
+                    }
+                );
+            } else {
+                setTimeout(
+                    resolve,
+                    0
+                );
+            }
         }
-    });
+    );
 }
